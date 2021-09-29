@@ -20,10 +20,9 @@ from tensor2tensor.utils import beam_search
 import tensorflow.compat.v1 as tf
 import tf_slim as slim
 
-from spreadsheet_coder import bert_modeling
-from spreadsheet_coder import constants
-from spreadsheet_coder import mobilebert_modeling
-from spreadsheet_coder import model_utils
+import bert_modeling
+import constants
+import mobilebert_modeling
 
 
 def create_model(
