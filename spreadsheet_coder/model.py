@@ -22,7 +22,6 @@ import tf_slim as slim
 
 import bert_modeling
 import constants
-import mobilebert_modeling
 
 
 def create_model(
@@ -182,12 +181,12 @@ def create_model(
               split_row_context_segment_ids[i:i + chunk_size],
               axis=-1)
         if use_mobilebert:
-          row_bert_context_model = mobilebert_modeling.BertModel(
-              config=bert_config, is_training=is_training,
-              input_ids=concat_row_cell_context, input_mask=concat_row_mask,
-              token_type_ids=concat_row_segment_ids,
-              use_one_hot_embeddings=use_one_hot_embeddings,
-              scope=bert_scope)
+          # row_bert_context_model = mobilebert_modeling.BertModel(
+          #     config=bert_config, is_training=is_training,
+          #     input_ids=concat_row_cell_context, input_mask=concat_row_mask,
+          #     token_type_ids=concat_row_segment_ids,
+          #     use_one_hot_embeddings=use_one_hot_embeddings,
+          #     scope=bert_scope)
         elif use_bert:
           row_bert_context_model = bert_modeling.BertModel(
               config=bert_config, is_training=is_training,
@@ -269,12 +268,12 @@ def create_model(
               split_col_context_segment_ids[i: i + chunk_size],
               axis=-1)
         if use_mobilebert:
-          col_bert_context_model = mobilebert_modeling.BertModel(
-              config=bert_config, is_training=is_training,
-              input_ids=concat_col_cell_context, input_mask=concat_col_mask,
-              token_type_ids=concat_col_segment_ids,
-              use_one_hot_embeddings=use_one_hot_embeddings,
-              scope=bert_scope)
+          # col_bert_context_model = mobilebert_modeling.BertModel(
+          #     config=bert_config, is_training=is_training,
+          #     input_ids=concat_col_cell_context, input_mask=concat_col_mask,
+          #     token_type_ids=concat_col_segment_ids,
+          #     use_one_hot_embeddings=use_one_hot_embeddings,
+          #     scope=bert_scope)
         elif use_bert:
           col_bert_context_model = bert_modeling.BertModel(
               config=bert_config, is_training=is_training,
