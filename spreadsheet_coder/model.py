@@ -181,6 +181,7 @@ def create_model(
               split_row_context_segment_ids[i:i + chunk_size],
               axis=-1)
         if use_mobilebert:
+          pass
           # row_bert_context_model = mobilebert_modeling.BertModel(
           #     config=bert_config, is_training=is_training,
           #     input_ids=concat_row_cell_context, input_mask=concat_row_mask,
@@ -268,6 +269,7 @@ def create_model(
               split_col_context_segment_ids[i: i + chunk_size],
               axis=-1)
         if use_mobilebert:
+          pass
           # col_bert_context_model = mobilebert_modeling.BertModel(
           #     config=bert_config, is_training=is_training,
           #     input_ids=concat_col_cell_context, input_mask=concat_col_mask,
