@@ -37,7 +37,51 @@ def create_model(
     grid_type, skip_connection, bert_config, unused_tensors_to_print,
     formula_length, formula_prefix_length, vocab_size, beam_size, use_tpu,
     use_one_hot_embeddings):
-  """Creates a program generator."""
+  """Creates a program generator.
+  Args:
+    num_encoder_layers/num_decoder_layers: int, hyper-parameter, number of LSTM layers.
+    embedding_size: int, hyper-parameter,  token/index embedding size.
+    hidden_size: int, hyper-parameter, LSTM hidden size.
+    dropout_rate: float, hyper-parameters.
+    is_training: bool.
+    formula: batch data.
+    row_cell_context/col_cell_context: [batch_size, height, max_cell_context_length]/
+    row_context_mask/col_context_mask: tf.float32, [batch_size, height, max_cell_context_length]/, for Flash-like setting & excluding headers.
+    row_context_segment_ids/col_context_segment_ids: [batch_size, height, max_cell_context_length]/
+    row_cell_indices/col_cell_indices: tf.int, [batch_size, row_height*row_width]/[batch_size, (col_height+1)*col_width].
+    row_context_mask_per_cell/col_context_mask_per_cell:  tf.float32, [batch_size,22,21]/
+    row_context_segment_ids_per_cell/col_context_segment_ids_per_cell: [batch_size,22,21]/, segmentIDs, header tokens 0, data tokens 1.
+    exclude_headers: bool.
+    max_cell_context_length: int, L in paper?
+    num_rows: int, D in paper?
+    record_index/column_index: [batch_size, cell_num], for cell position encoding if cell_context_encoding = False.
+    layer_norm: bool
+    cell_position_encoding: bool
+    cell_context_encoding: bool
+    use_bert: bool
+    use_mobilebert: bool
+    per_row_encoding: bool
+    max_pooling: bool
+    use_cnn: bool
+    use_pointer_network: bool
+    two_stage_decoding: bool
+    conv_type: str, "grid"/"cross"?
+    grid_type: str, "col"/"row"/"both"
+    skip_connection: bool
+    bert_config: bert_modeling.BertModel(bert_config).
+    unused_tensors_to_print: not used
+    formula_length: int.
+    formula_prefix_length: int.
+    vocab_size: int, size of output formula token vocabulary, including sketches(vocab_size-42) and ranges(42).
+    beam_size: int.
+    use_tpu: bool, for beam search.
+    use_one_hot_embeddings: bool, for BertModel.
+
+  Returns:
+    If is_training = True or beam_size <= 1, return logits[batch_size, formula_length, vocab_size], otherwise
+    return beam_seqs[batch_size, beam_size, formula_prefix_length + decode_length], beam_probs[batch_size, beam_size].
+  """
+
   use_dropout = is_training
   input_shape = bert_modeling.get_shape_list(
       formula, expected_rank=2)
@@ -921,7 +965,7 @@ def create_model(
         pred_logits, beam_search_state = symbols_to_logits(
             partial_seqs, cur_step, beam_search_state)
         logits.append(pred_logits)
-      logits = tf.stack(logits, axis=1)
+      logits = tf.stack(logits, axis=1) # tf[batch_size, formula_length, 'vocab_size']
       return logits
     elif beam_size <= 1:
       input_tokens = initial_input_tokens
@@ -962,11 +1006,11 @@ def create_model(
           states=beam_search_state,
           eos_id=constants.EOF_ID,
           stop_early=False,
-          use_tpu=use_tpu)
+          use_tpu=use_tpu)  # (decoded beams [batch_size, beam_size, decode_length], decoding probabilities [batch_size, beam_size])
       if formula_prefix_length > 0:
         initial_partial_seqs = tf.slice(
             full_formula, [0, 0], [batch_size, formula_prefix_length])
-        initial_partial_seqs = tf.expand_dims(initial_partial_seqs, axis=1)
-        initial_partial_seqs = tf.tile(initial_partial_seqs, [1, beam_size, 1])
-        beam_seqs = tf.concat([initial_partial_seqs, beam_seqs], axis=2)
+        initial_partial_seqs = tf.expand_dims(initial_partial_seqs, axis=1) # [batch_size, 1, formula_prefix_length]
+        initial_partial_seqs = tf.tile(initial_partial_seqs, [1, beam_size, 1]) # [batch_size, beam_size, formula_prefix_length]
+        beam_seqs = tf.concat([initial_partial_seqs, beam_seqs], axis=2) # [batch_size, beam_size, formula_prefix_length + decode_length]
       return beam_seqs, beam_probs
