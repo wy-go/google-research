@@ -45,12 +45,12 @@ def create_model(
     dropout_rate: float, hyper-parameters.
     is_training: bool.
     formula: batch data.
-    row_cell_context/col_cell_context: [batch_size, height, max_cell_context_length]/
-    row_context_mask/col_context_mask: tf.float32, [batch_size, height, max_cell_context_length]/, for Flash-like setting & excluding headers.
-    row_context_segment_ids/col_context_segment_ids: [batch_size, height, max_cell_context_length]/
+    row_cell_context/col_cell_context: tf.int32, [batch_size, height*max_cell_context_length]
+    row_context_mask/col_context_mask: tf.float32, [batch_size, height*max_cell_context_length], for Flash-like setting & excluding headers.
+    row_context_segment_ids/col_context_segment_ids: [batch_size, height*max_cell_context_length]
     row_cell_indices/col_cell_indices: tf.int, [batch_size, row_height*row_width]/[batch_size, (col_height+1)*col_width].
-    row_context_mask_per_cell/col_context_mask_per_cell:  tf.float32, [batch_size,22,21]/
-    row_context_segment_ids_per_cell/col_context_segment_ids_per_cell: [batch_size,22,21]/, segmentIDs, header tokens 0, data tokens 1.
+    row_context_mask_per_cell/col_context_mask_per_cell:  tf.float32, [batch_size,22*21]/
+    row_context_segment_ids_per_cell/col_context_segment_ids_per_cell: [batch_size,22*21]/, segmentIDs, header tokens 0, data tokens 1.
     exclude_headers: bool.
     max_cell_context_length: int, L in paper?
     num_rows: int, D in paper?
@@ -60,13 +60,13 @@ def create_model(
     cell_context_encoding: bool
     use_bert: bool
     use_mobilebert: bool
-    per_row_encoding: bool
+    per_row_encoding: bool, do not use bundle, feed each row seperately to BERT
     max_pooling: bool
     use_cnn: bool
     use_pointer_network: bool
     two_stage_decoding: bool
     conv_type: str, "grid"/"cross"?
-    grid_type: str, "col"/"row"/"both"
+    grid_type: str, "col"/"row"/"both", BERT type
     skip_connection: bool
     bert_config: bert_modeling.BertModel(bert_config).
     unused_tensors_to_print: not used
@@ -91,6 +91,7 @@ def create_model(
   row_width = 21    # 2D+1
   col_width = 22    # 2D+1+1
 
+  # Multiply all masks and row_cell_context with segment_ids
   if exclude_headers:
     row_context_mask *= tf.cast(row_context_segment_ids, dtype=tf.float32)
     row_context_mask_per_cell *= tf.cast(row_context_segment_ids_per_cell,
@@ -100,24 +101,28 @@ def create_model(
                                          dtype=tf.float32)
     row_cell_context *= row_context_segment_ids
 
-  if num_rows < 21: # Flash-like setting 21->11?
+  # FlashFill-like setting, when the input includes 1–11 data rows, we grow the input from the target row upward.
+  # Construct masks, multiply row masks and row_cell_context with them.
+  if num_rows < 21: # FlashFill-like setting 21->11?
     cell_data_mask = ([1] * max_cell_context_length +
                       [0] * max_cell_context_length * (10 - num_rows) +
                       [1] * max_cell_context_length * (num_rows + 1) +
                       [0] * max_cell_context_length * 10)
     cell_data_mask = tf.convert_to_tensor(np.array(cell_data_mask),
                                           dtype=tf.float32)
-    cell_data_mask = tf.expand_dims(cell_data_mask, dim=0)  # tf.float32[1,22,max_cell_context_length]
+    cell_data_mask = tf.expand_dims(cell_data_mask, dim=0)  # tf.float32[1,22*max_cell_context_length]
     cell_data_mask_per_cell = ([1] * 21 + [0] * 21 * (10 - num_rows) +
                                [1] * 21 * (num_rows + 1) + [0] * 21 * 10)
     cell_data_mask_per_cell = tf.convert_to_tensor(
         np.array(cell_data_mask_per_cell), dtype=tf.float32)
-    cell_data_mask_per_cell = tf.expand_dims(cell_data_mask_per_cell, dim=0) # tf.float32[1,22,21]
+    cell_data_mask_per_cell = tf.expand_dims(cell_data_mask_per_cell, dim=0) # tf.float32[1,22*21]
     row_cell_context *= tf.cast(cell_data_mask, dtype=tf.int32)
     row_context_mask *= cell_data_mask
     row_context_mask_per_cell *= cell_data_mask_per_cell
 
   if cell_context_encoding:
+    # Get header, header_mask, header_segment_ids: [batch_size, max_cell_context_length],
+    # row_context_grid = [], header_encoding = []
     if grid_type != "col":  # Row-based
       reshape_row_cell_context = tf.reshape(
           row_cell_context, [batch_size, height, max_cell_context_length])
@@ -147,12 +152,14 @@ def create_model(
           split_row_context_mask = split_row_context_mask[:12]
           split_row_context_segment_ids = split_row_context_segment_ids[:12]
           height = 12
-      header = tf.squeeze(split_row_cell_context[0], axis=1)
-      header_mask = tf.squeeze(split_row_context_mask[0], axis=1)
-      header_segment_ids = tf.squeeze(split_row_context_segment_ids[0], axis=1)
+      header = tf.squeeze(split_row_cell_context[0], axis=1) # [batch_size, max_cell_context_length]
+      header_mask = tf.squeeze(split_row_context_mask[0], axis=1) # [batch_size, max_cell_context_length]
+      header_segment_ids = tf.squeeze(split_row_context_segment_ids[0], axis=1) # [batch_size, max_cell_context_length]
       row_context_grid = []
       header_encoding = []
 
+    # Get cur_col, cur_col_mask, cur_col_segment_ids: [batch_size, max_cell_context_length],
+    # col_context_grid = []
     if grid_type != "row":  # Column-based
       reshape_col_cell_context = tf.reshape(
           col_cell_context, [batch_size, height, max_cell_context_length])
@@ -172,12 +179,13 @@ def create_model(
         split_col_context_mask = split_col_context_mask[:12]
         split_col_context_segment_ids = split_col_context_segment_ids[:12]
         height = 12
-      cur_col = tf.squeeze(split_col_cell_context[0], axis=1)
-      cur_col_mask = tf.squeeze(split_col_context_mask[0], axis=1)
-      cur_col_segment_ids = tf.squeeze(split_col_context_segment_ids[0], axis=1)
+      cur_col = tf.squeeze(split_col_cell_context[0], axis=1) # [batch_size, max_cell_context_length]
+      cur_col_mask = tf.squeeze(split_col_context_mask[0], axis=1) # [batch_size, max_cell_context_length]
+      cur_col_segment_ids = tf.squeeze(split_col_context_segment_ids[0], axis=1) # [batch_size, max_cell_context_length]
       col_context_grid = []
 
     if grid_type != "col":  # Row-based
+      # Set bundle size(chunk_size) and start row index(st_idx)
       if per_row_encoding:
         chunk_size = 1
         st_idx = 0
@@ -185,6 +193,7 @@ def create_model(
         chunk_size = 512 // max_cell_context_length - 1
         st_idx = 1
 
+      # Set bert_scope
       if use_bert or use_mobilebert:
         if grid_type == "both":
           bert_scope = "row/bert"
@@ -202,7 +211,12 @@ def create_model(
           row_context_encoder_cells = tf.keras.layers.StackedRNNCells(
               row_context_encoder_cells)
 
+      # header_encoding[batch_size, max_cell_context_length, -1] if per_row_encoding is False,
+      # list row_context_grid of length height,
+      # element size: [batch_size, max_cell_context_length, -1]
       for i in range(st_idx, height, chunk_size):
+
+        # Squeeze split_row_xxx: list of tensor[batch_size, max_cell_context_length]
         for j in range(chunk_size):
           split_row_cell_context[i + j] = tf.squeeze(
               split_row_cell_context[i + j], axis=1)
@@ -210,13 +224,16 @@ def create_model(
               split_row_context_mask[i + j], axis=1)
           split_row_context_segment_ids[i + j] = tf.squeeze(
               split_row_context_segment_ids[i + j], axis=1)
+
+        # Concat row_xxx: [batch_size, (chunk_size+1)*max_cell_context_length] or [batch_size, max_cell_context_length]
+        # if per_row_encoding is True
         if per_row_encoding:
           concat_row_cell_context = split_row_cell_context[i]
           concat_row_mask = split_row_context_mask[i]
           concat_row_segment_ids = split_row_context_segment_ids[i]
         else:
           concat_row_cell_context = tf.concat(
-              [header] + split_row_cell_context[i: i + chunk_size], axis=-1)
+              [header] + split_row_cell_context[i: i + chunk_size], axis=-1) # [batch_size, (chunk_size+1)*max_cell_context_length]
           concat_row_mask = tf.concat(
               [header_mask] + split_row_context_mask[i: i + chunk_size],
               axis=-1)
@@ -224,6 +241,8 @@ def create_model(
               [header_segment_ids] +
               split_row_context_segment_ids[i:i + chunk_size],
               axis=-1)
+
+        # row_bert_context_model
         if use_mobilebert:
           pass
           # row_bert_context_model = mobilebert_modeling.BertModel(
@@ -251,21 +270,27 @@ def create_model(
         if use_bert or use_mobilebert:
           row_context_sequence_output = (
               row_bert_context_model.get_sequence_output())
+
         row_context_sequence_output = tf.reshape(
             row_context_sequence_output,
             [batch_size, chunk_size + st_idx, max_cell_context_length, -1])
         row_context_sequence_output = tf.split(
-            row_context_sequence_output, chunk_size + st_idx, axis=1)
+            row_context_sequence_output, chunk_size + st_idx, axis=1) # list of tensor[batch_size, 1, max_cell_context_length, -1], len=chunk_size+st_idx
         if not per_row_encoding:
-          header_encoding.append(row_context_sequence_output[0])
+          header_encoding.append(row_context_sequence_output[0]) # list of length (height-st_idx)/chunk_size
         for j in range(st_idx, chunk_size + st_idx):
           row_context_sequence_output[j] = tf.squeeze(
-              row_context_sequence_output[j], axis=1)
+              row_context_sequence_output[j], axis=1) # [batch_size, max_cell_context_length, -1]
           row_context_grid.append(row_context_sequence_output[j])
+
+      # Take average value of header, add it to list row_context_grid
       if not per_row_encoding:
-        header_encoding = tf.concat(header_encoding, axis=1)
-        header_encoding = tf.reduce_mean(header_encoding, axis=1)
+        header_encoding = tf.concat(header_encoding, axis=1) # [batch_size, (height-st_idx)/chunk_size, max_cell_context_length, -1]
+        header_encoding = tf.reduce_mean(header_encoding, axis=1) # [batch_size, max_cell_context_length, -1]
         row_context_grid = [header_encoding] + row_context_grid
+
+    # list col_context_grid of length (height-1),
+    # element size: [batch_size, max_cell_context_length, -1]
     if grid_type != "row":  # Column-based
       if per_row_encoding:
         chunk_size = 1
@@ -290,6 +315,7 @@ def create_model(
                                        for _ in range(num_encoder_layers)]
           col_context_encoder_cells = tf.keras.layers.StackedRNNCells(
               col_context_encoder_cells)
+
       for i in range(1, height, chunk_size):
         for j in range(chunk_size):
           split_col_cell_context[i + j] = tf.squeeze(
@@ -298,6 +324,7 @@ def create_model(
               split_col_context_mask[i + j], axis=1)
           split_col_context_segment_ids[i + j] = tf.squeeze(
               split_col_context_segment_ids[i + j], axis=1)
+
         if per_row_encoding:
           concat_col_cell_context = split_col_cell_context[i]
           concat_col_mask = split_col_context_mask[i]
@@ -312,6 +339,7 @@ def create_model(
               [cur_col_segment_ids] +
               split_col_context_segment_ids[i: i + chunk_size],
               axis=-1)
+
         if use_mobilebert:
           pass
           # col_bert_context_model = mobilebert_modeling.BertModel(
@@ -336,9 +364,11 @@ def create_model(
               initial_state=col_context_encoder_cells.get_initial_state(
                   batch_size=batch_size, dtype=tf.float32),
               dtype=tf.float32)
+
         if use_bert or use_mobilebert:
           col_context_sequence_output = (
               col_bert_context_model.get_sequence_output())
+
         col_context_sequence_output = tf.reshape(
             col_context_sequence_output,
             [batch_size, chunk_size + st_idx, max_cell_context_length, -1])
@@ -348,6 +378,7 @@ def create_model(
           col_context_sequence_output[j] = tf.squeeze(
               col_context_sequence_output[j], axis=1)
           col_context_grid.append(col_context_sequence_output[j])
+
   if cell_context_encoding:
     with tf.variable_scope("encode", reuse=tf.AUTO_REUSE):
       if grid_type != "col":
