@@ -207,7 +207,7 @@ def create_model(
               name="cell_context_embedding",
               shape=[bert_vocab_size, embedding_size],
               initializer=tf.truncated_normal_initializer(stddev=0.02))
-          row_context_encoder_cells = [tf.nn.rnn_cell.LSTMCell(hidden_size, initializer=tf.glorot_uniform_initializer())
+          row_context_encoder_cells = [tf.nn.rnn_cell.LSTMCell(hidden_size, initializer=tf.keras.initializers.glorot_uniform())
                                        for _ in range(num_encoder_layers)]
           row_context_encoder_cells = tf.nn.rnn_cell.MultiRNNCell(
               row_context_encoder_cells)
@@ -312,7 +312,7 @@ def create_model(
               name="cell_context_embedding",
               shape=[bert_vocab_size, embedding_size],
               initializer=tf.truncated_normal_initializer(stddev=0.02))
-          col_context_encoder_cells = [tf.nn.rnn_cell.LSTMCell(hidden_size, initializer=tf.glorot_uniform_initializer())
+          col_context_encoder_cells = [tf.nn.rnn_cell.LSTMCell(hidden_size, initializer=tf.keras.initializers.glorot_uniform())
                                        for _ in range(num_encoder_layers)]
           col_context_encoder_cells = tf.nn.rnn_cell.MultiRNNCell(
               col_context_encoder_cells)
@@ -762,7 +762,7 @@ def create_model(
                                                      cell_indices)
 
     if cell_position_encoding:
-      encoder_cells = [tf.nn.rnn_cell.LSTMCell(hidden_size, initializer=tf.glorot_uniform_initializer())
+      encoder_cells = [tf.nn.rnn_cell.LSTMCell(hidden_size, initializer=tf.keras.initializers.glorot_uniform())
                        for _ in range(num_encoder_layers)]
       encoder_cells = tf.nn.rnn_cell.MultiRNNCell(encoder_cells)
       encoder_state = encoder_cells.get_initial_state(
@@ -803,7 +803,7 @@ def create_model(
         shape=[vocab_size, embedding_size],
         initializer=tf.truncated_normal_initializer(stddev=0.02))
 
-    cells = [tf.nn.rnn_cell.LSTMCell(hidden_size, initializer=tf.glorot_uniform_initializer())
+    cells = [tf.nn.rnn_cell.LSTMCell(hidden_size, initializer=tf.keras.initializers.glorot_uniform())
              for _ in range(num_decoder_layers)]
     cells = tf.nn.rnn_cell.MultiRNNCell(cells)
 
@@ -824,9 +824,8 @@ def create_model(
           tf.equal(tf.reshape(input_tokens, [-1]), sketch_idx),
           tf.tile(range_mask, [beam_size, 1]), cur_formula_mask)    # [batch_size*beam_size, vocab_size]
 
-      #  is_training=True:
-      #    cur_range_bool_mask=range_bool_mask,
-      #    [batch_size, 1]<-([batch_size], 1[batch_size, 1], 1[batch_size, 1])
+      #  is_training=True: switch where $ENDFORMULASKETCH$ appears
+      #    cur_range_bool_mask=range_bool_mask, [batch_size, 1]<-([batch_size], 1[batch_size, 1], 1[batch_size, 1])
       cur_range_bool_mask = tf.where(
           tf.equal(tf.reshape(input_tokens, [-1]), sketch_idx),
           tf.tile(1 - range_bool_mask, [beam_size, 1]), cur_range_bool_mask)
@@ -958,12 +957,12 @@ def create_model(
             activation=None,
             kernel_initializer=tf.truncated_normal_initializer(stddev=0.02),
             name="range_logit")
-        range_logits = tf.squeeze(range_logits, axis=-2)
+        range_logits = tf.squeeze(range_logits, axis=-2)  # [batch_size, height', vocab_size]?
 
       if two_stage_decoding:
         pred_logits = tf.where(
-            tf.equal(tf.reshape(cur_range_bool_mask, [-1]), 0),
-            tf.squeeze(sketch_logits, axis=-2),
+            tf.equal(tf.reshape(cur_range_bool_mask, [-1]), 0), # [batch_size, 1]
+            tf.squeeze(sketch_logits, axis=-2),  # [batch_size, height', vocab_size]?
             range_logits)
       elif use_pointer_network:
         pred_logits = range_logits
