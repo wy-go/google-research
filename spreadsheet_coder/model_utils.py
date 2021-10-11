@@ -21,8 +21,6 @@ from six.moves import zip
 import tensorflow.compat.v1 as tf
 import tensorflow.compat.v2 as tf2
 
-from tensorflow.contrib.layers.python.layers import initializers
-import tensorflow.contrib.rnn as contrib_rnn
 from tensorflow.python.ops import math_ops
 
 
@@ -257,14 +255,6 @@ def construct_scalar_host_call(monitor_dict, model_dir,
   other_tensors = [tf.reshape(monitor_dict[key], [1]) for key in metric_names]
 
   return host_call_fn, [global_step_tensor] + other_tensors
-
-
-def build_lstm(num_units):
-  return contrib_rnn.LSTMCell(
-      num_units=num_units,
-      initializer=initializers.xavier_initializer(),
-      state_is_tuple=True,
-      activation=tf.tanh)
 
 
 def print_tensors(**tensors):

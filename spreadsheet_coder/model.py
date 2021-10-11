@@ -41,7 +41,7 @@ def create_model(
   Args:
     num_encoder_layers/num_decoder_layers: int, hyper-parameter, number of LSTM layers.
     embedding_size: int, hyper-parameter,  token/index embedding size.
-    hidden_size: int, hyper-parameter, LSTM hidden size.
+    hidden_size: int, hyper-parameter, CNN kernel size & LSTM hidden size.
     dropout_rate: float, hyper-parameters.
     is_training: bool.
     formula: batch data.
@@ -55,7 +55,7 @@ def create_model(
     max_cell_context_length: int, L in paper?
     num_rows: int, D in paper?
     record_index/column_index: [batch_size, cell_num], for cell position encoding if cell_context_encoding = False.
-    layer_norm: bool
+    layer_norm: bool, add layer normalization layer after fully connected layer of the context encoder.
     cell_position_encoding: bool
     cell_context_encoding: bool
     use_bert: bool
@@ -65,15 +65,16 @@ def create_model(
     use_cnn: bool
     use_pointer_network: bool
     two_stage_decoding: bool
-    conv_type: str, "grid"/"cross"?
+    conv_type: str, "grid"/"cross" or else, if using "grid", convolution with a height*width kernel;
+                if using "cross", convolution with a row-wise and column-wise kernel and add the result; else only use column-wise kernel
     grid_type: str, "col"/"row"/"both", BERT type
-    skip_connection: bool
+    skip_connection: bool, if True, concat convolution output and BERT encoding output; if False only use convolution output.
     bert_config: bert_modeling.BertModel(bert_config).
     unused_tensors_to_print: not used
     formula_length: int.
     formula_prefix_length: int.
     vocab_size: int, size of output formula token vocabulary, including sketches(vocab_size-42) and ranges(42).
-    beam_size: int.
+    beam_size: int, if is_training is True, beam_size should be 1.
     use_tpu: bool, for beam search.
     use_one_hot_embeddings: bool, for BertModel.
 
@@ -206,9 +207,9 @@ def create_model(
               name="cell_context_embedding",
               shape=[bert_vocab_size, embedding_size],
               initializer=tf.truncated_normal_initializer(stddev=0.02))
-          row_context_encoder_cells = [tf.keras.layers.LSTMCell(hidden_size)
+          row_context_encoder_cells = [tf.nn.rnn_cell.LSTMCell(hidden_size, initializer=tf.glorot_uniform_initializer())
                                        for _ in range(num_encoder_layers)]
-          row_context_encoder_cells = tf.keras.layers.StackedRNNCells(
+          row_context_encoder_cells = tf.nn.rnn_cell.MultiRNNCell(
               row_context_encoder_cells)
 
       # header_encoding[batch_size, max_cell_context_length, -1] if per_row_encoding is False,
@@ -311,9 +312,9 @@ def create_model(
               name="cell_context_embedding",
               shape=[bert_vocab_size, embedding_size],
               initializer=tf.truncated_normal_initializer(stddev=0.02))
-          col_context_encoder_cells = [tf.keras.layers.LSTMCell(hidden_size)
+          col_context_encoder_cells = [tf.nn.rnn_cell.LSTMCell(hidden_size, initializer=tf.glorot_uniform_initializer())
                                        for _ in range(num_encoder_layers)]
-          col_context_encoder_cells = tf.keras.layers.StackedRNNCells(
+          col_context_encoder_cells = tf.nn.rnn_cell.MultiRNNCell(
               col_context_encoder_cells)
 
       for i in range(1, height, chunk_size):
@@ -379,13 +380,23 @@ def create_model(
               col_context_sequence_output[j], axis=1)
           col_context_grid.append(col_context_sequence_output[j])
 
+  # if grid_type is "both",
+  #   context_encoder_output[batch_size, (row_height+col_height) * max_cell_context_length, hidden_size]
   if cell_context_encoding:
     with tf.variable_scope("encode", reuse=tf.AUTO_REUSE):
+
+      # row-based BERT -> convolutional -> full connection(individually for header and cell data),
+      # get row_context_encoder_output[batch_size, row_height * max_cell_context_length, hidden_size],
+      # row_cell_data_mask=row_context_segment_ids*row_context_mask[batch_size, height*max_cell_context_length, 1],
+      # row_header_mask=(1-row_context_segment_ids)*row_context_mask[batch_size, height*max_cell_context_length, 1],
       if grid_type != "col":
         with tf.variable_scope("row", reuse=tf.AUTO_REUSE):
-          row_context_grid = tf.stack(row_context_grid, axis=1)
+          row_context_grid = tf.stack(row_context_grid, axis=1) # [batch_size, row_height, max_cell_context_length, -1]
           _, row_height, width, _ = bert_modeling.get_shape_list(
               row_context_grid, expected_rank=4)
+
+          # Add convolution layer to row-based BERT,
+          # get row_context_sequence_output[batch_size, row_height * max_cell_context_length, -1]
           if use_cnn:
             if conv_type == "grid":
               # Adds a conv layer with hidden_size filters of size [hxw],
@@ -484,13 +495,13 @@ def create_model(
                 [output_token_embeddings[0],
                  row_row_pooled_output, row_col_pooled_output,
                  output_token_embeddings[1]], axis=1)
-          row_context_mask = tf.expand_dims(row_context_mask, axis=-1)
+          row_context_mask = tf.expand_dims(row_context_mask, axis=-1)  # [batch_size, height*max_cell_context_length, 1]
           row_cell_data_encoder_output = tf.layers.dense(
               row_context_sequence_output,
               hidden_size,
               activation=None,
               kernel_initializer=tf.truncated_normal_initializer(stddev=0.02),
-              name="cell_data_encoder_output")
+              name="cell_data_encoder_output") # [batch_size, row_height * max_cell_context_length, hidden_size]
           row_header_encoder_output = tf.layers.dense(
               row_context_sequence_output,
               hidden_size,
@@ -543,9 +554,13 @@ def create_model(
               row_header_encoder_output * row_header_mask
               + row_cell_data_encoder_output * row_cell_data_mask)
 
+      # col-based BERT -> convolutional -> full connection(individually for col_header and cell data),
+      # get col_context_encoder_output[batch_size, col_height * max_cell_context_length, hidden_size],
+      # col_cell_data_mask=col_context_segment_ids*col_context_mask[batch_size, 21*max_cell_context_length, 1],
+      # col_header_mask=(1-col_context_segment_ids)*col_context_mask[batch_size, 21*max_cell_context_length, 1],
       if grid_type != "row":
         with tf.variable_scope("col", reuse=tf.AUTO_REUSE):
-          col_context_grid = tf.stack(col_context_grid, axis=1)
+          col_context_grid = tf.stack(col_context_grid, axis=1) # [batch_size, col_height, max_cell_context_length, -1]
           _, col_height, width, _ = bert_modeling.get_shape_list(
               col_context_grid, expected_rank=4)
           if use_cnn:
@@ -711,6 +726,7 @@ def create_model(
           col_context_encoder_output = (
               col_header_encoder_output * col_header_mask +
               col_cell_data_encoder_output * col_cell_data_mask)
+
       if grid_type == "row":
         context_encoder_output = row_context_encoder_output
         cell_data_mask = row_cell_data_mask
@@ -731,20 +747,24 @@ def create_model(
                                                dropout_rate,
                                                training=use_dropout,
                                                name="context_encoder_dropout")
+
+  # ???
+  # cell_indices_embeddings[batch_size, ?, embedding_size],
+  # encoder_state: num_encoder_layers-tuple containing LSTMStateTuple
   with tf.variable_scope("cell_index_encoder", reuse=tf.AUTO_REUSE):
     index_embedding = tf.get_variable(
         name="cell_index_embedding",
         shape=[1000, embedding_size],
-        initializer=tf.truncated_normal_initializer(stddev=0.02))
+        initializer=tf.truncated_normal_initializer(stddev=0.02)) # [1000, embedding_size]
 
     cell_indices = tf.concat([column_index, record_index], axis=1)
     cell_indices_embeddings = tf.nn.embedding_lookup(index_embedding,
                                                      cell_indices)
 
     if cell_position_encoding:
-      encoder_cells = [tf.keras.layers.LSTMCell(hidden_size)
+      encoder_cells = [tf.nn.rnn_cell.LSTMCell(hidden_size, initializer=tf.glorot_uniform_initializer())
                        for _ in range(num_encoder_layers)]
-      encoder_cells = tf.keras.layers.StackedRNNCells(encoder_cells)
+      encoder_cells = tf.nn.rnn_cell.MultiRNNCell(encoder_cells)
       encoder_state = encoder_cells.get_initial_state(
           batch_size=batch_size, dtype=tf.float32)
       _, encoder_state = tf.nn.dynamic_rnn(
@@ -761,7 +781,7 @@ def create_model(
   sketch_mask = tf.tile(sketch_mask, [batch_size, 1])   # tf.float32[batch_size, vocab_size]
 
   range_mask = [0] * vocab_size
-  range_mask[constants.RANGE_TOKEN_ID] = 1
+  range_mask[constants.RANGE_TOKEN_ID] = 1 # ？？？
   range_mask[constants.RANGE_SPLIT_ID] = 1
   range_mask[constants.END_RANGE_ID] = 1
   range_mask[constants.EOF_ID] = 1
@@ -783,9 +803,9 @@ def create_model(
         shape=[vocab_size, embedding_size],
         initializer=tf.truncated_normal_initializer(stddev=0.02))
 
-    cells = [tf.keras.layers.LSTMCell(hidden_size)
+    cells = [tf.nn.rnn_cell.LSTMCell(hidden_size, initializer=tf.glorot_uniform_initializer())
              for _ in range(num_decoder_layers)]
-    cells = tf.keras.layers.StackedRNNCells(cells)
+    cells = tf.nn.rnn_cell.MultiRNNCell(cells)
 
     def symbols_to_logits(partial_seqs, cur_step, beam_search_state):
       decoder_state = beam_search_state.get("decoder_state")
@@ -797,26 +817,31 @@ def create_model(
 
       sketch_idx = tf.constant(constants.END_FORMULA_SKETCH_ID, dtype=tf.int32)
 
-      # ([batch_size*beam_size], [beam_size,vocab_size], [])
+      # is_training=True:
+      #   cur_formula_mask=sketch_mask,
+      #   [batch_size, vocab_size]<-([batch_size], [batch_size, vocab_size], [batch_size, vocab_size])
       cur_formula_mask = tf.where(
           tf.equal(tf.reshape(input_tokens, [-1]), sketch_idx),
           tf.tile(range_mask, [beam_size, 1]), cur_formula_mask)    # [batch_size*beam_size, vocab_size]
 
-      #  ([batch_size*beam_size], 0[batch_size, 1], [])
+      #  is_training=True:
+      #    cur_range_bool_mask=range_bool_mask,
+      #    [batch_size, 1]<-([batch_size], 1[batch_size, 1], 1[batch_size, 1])
       cur_range_bool_mask = tf.where(
           tf.equal(tf.reshape(input_tokens, [-1]), sketch_idx),
           tf.tile(1 - range_bool_mask, [beam_size, 1]), cur_range_bool_mask)
 
       input_embeddings = tf.nn.embedding_lookup(
           token_embedding,
-          input_tokens)
+          input_tokens) # [batch_size*beam_size, embedding_size]
 
       decoder_output, decoder_state = tf.nn.dynamic_rnn(
           cells,
           input_embeddings,
           initial_state=decoder_state,
-          dtype=tf.float32)
+          dtype=tf.float32) # [batch_size, max_time, hidden_size],
 
+      # decoder_output[batch_size, height', max_time, hidden_size * 3]
       if cell_context_encoding:
         context_encoder_output = beam_search_state.get("context_encoder_output")
         cell_data_mask = beam_search_state.get("cell_data_mask")
@@ -825,10 +850,12 @@ def create_model(
           output_token_embeddings = beam_search_state.get(
               "output_token_embeddings")
 
+        # reshape context_encoder_output, cell_data_mask, header_mask -> [batch_size * beam_size, height, max_cell_context_length, -1]
+        # decoder_output: [batch_size, height, max_time, hidden_size]
         if max_pooling:
           context_shape = bert_modeling.get_shape_list(
-              context_encoder_output, expected_rank=3)
-          height = context_shape[1] // max_cell_context_length
+              context_encoder_output, expected_rank=3) # [batch_size, (row_height+col_height) * max_cell_context_length, hidden_size]
+          height = context_shape[1] // max_cell_context_length # if "both", row_height + col_height
           context_encoder_output = tf.reshape(
               context_encoder_output,
               [batch_size * beam_size, height, max_cell_context_length, -1])
@@ -839,20 +866,21 @@ def create_model(
               header_mask,
               [batch_size * beam_size, height, max_cell_context_length, -1]
               )
-          decoder_output = tf.expand_dims(decoder_output, axis=1)
+          decoder_output = tf.expand_dims(decoder_output, axis=1) # [batch_size, 1, max_time, hidden_size]
           decoder_output = tf.repeat(
-              decoder_output, repeats=height, axis=1)
+              decoder_output, repeats=height, axis=1) # [batch_size, height', max_time, hidden_size]
 
+        # Attention to cell data
         cell_data_attn_vec = tf.layers.dense(
             decoder_output,
             hidden_size,
             activation=None,
             kernel_initializer=tf.truncated_normal_initializer(stddev=0.02),
-            name="cell_data_encoder_attention_layer")
+            name="cell_data_encoder_attention_layer") # [batch_size, height', max_time, hidden_size]
 
         cell_data_encoder_attn_w = tf.matmul(context_encoder_output,
                                              cell_data_attn_vec,
-                                             transpose_b=True)
+                                             transpose_b=True) # [batch_size, height', max_cell_context_length, max_time]
         cell_data_encoder_attn_w = tf.layers.dropout(
             cell_data_encoder_attn_w, dropout_rate, training=use_dropout,
             name="cell_data_attn_dropout")
@@ -861,14 +889,15 @@ def create_model(
                                                  axis=-2)
         cell_data_encoder_embeddings = tf.matmul(cell_data_encoder_attn_w,
                                                  context_encoder_output,
-                                                 transpose_a=True)
+                                                 transpose_a=True) # [batch_size, height', max_time, -1]
         cell_data_encoder_vec = tf.layers.dense(
             cell_data_encoder_embeddings,
             hidden_size,
             activation=None,
             kernel_initializer=tf.truncated_normal_initializer(stddev=0.02),
-            name="cell_data_encoder_linear")
+            name="cell_data_encoder_linear") # [batch_size, height', max_time, hidden_size]
 
+        # Attention to header
         header_attn_vec = tf.layers.dense(
             decoder_output,
             hidden_size,
@@ -892,24 +921,24 @@ def create_model(
             hidden_size,
             activation=None,
             kernel_initializer=tf.truncated_normal_initializer(stddev=0.02),
-            name="header_encoder_linear")
+            name="header_encoder_linear") # [batch_size, height', max_time, hidden_size]
 
         decoder_vec = tf.layers.dense(
             decoder_output,
             hidden_size,
             activation=None,
             kernel_initializer=tf.truncated_normal_initializer(stddev=0.02),
-            name="decoder_linear")
+            name="decoder_linear") # [batch_size, height', max_time, hidden_size]
 
         decoder_output = tf.concat(
-            [cell_data_encoder_vec, header_encoder_vec, decoder_vec], axis=-1)
+            [cell_data_encoder_vec, header_encoder_vec, decoder_vec], axis=-1) # [batch_size, height', max_time, hidden_size * 3]
 
       sketch_logits = tf.layers.dense(
           decoder_output,
           vocab_size,
           activation=None,
           kernel_initializer=tf.truncated_normal_initializer(stddev=0.02),
-          name="formula_sketch_logit")
+          name="formula_sketch_logit") # [batch_size, height', max_time, vocab_size]
 
       if use_pointer_network:
         range_attn_vec = tf.layers.dense(
@@ -989,14 +1018,14 @@ def create_model(
 
     if is_training:
       initial_input_tokens = tf.expand_dims(initial_input_tokens, axis=1)  # tf.int32[batch_size, 1]
-      full_formula = tf.concat([initial_input_tokens, formula], axis=1)
+      full_formula = tf.concat([initial_input_tokens, formula], axis=1) # tf.int32[batch_size, 1+formula_length]
       for cur_step in range(formula_length):
         partial_seqs = tf.slice(
-            full_formula, [0, 0], [batch_size, cur_step + 1])
+            full_formula, [0, 0], [batch_size, cur_step + 1]) # tf.int32[batch_size, cur_step+1]
         pred_logits, beam_search_state = symbols_to_logits(
             partial_seqs, cur_step, beam_search_state)
         logits.append(pred_logits)
-      logits = tf.stack(logits, axis=1) # tf[batch_size, formula_length, 'vocab_size']
+      logits = tf.stack(logits, axis=1) # tf.int32[batch_size, formula_length, vocab_size]
       return logits
     elif beam_size <= 1:
       input_tokens = initial_input_tokens
