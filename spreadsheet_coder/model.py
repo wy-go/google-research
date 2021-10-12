@@ -45,35 +45,35 @@ def create_model(
     dropout_rate: float, hyper-parameters.
     is_training: bool.
     formula: batch data.
-    row_cell_context/col_cell_context: tf.int32, [batch_size, height*max_cell_context_length]
+    row_cell_context/col_cell_context: tf.int32, [batch_size, height*max_cell_context_length].
     row_context_mask/col_context_mask: tf.float32, [batch_size, height*max_cell_context_length], for Flash-like setting & excluding headers.
-    row_context_segment_ids/col_context_segment_ids: [batch_size, height*max_cell_context_length]
-    row_cell_indices/col_cell_indices: tf.int, [batch_size, row_height*row_width]/[batch_size, (col_height+1)*col_width].
-    row_context_mask_per_cell/col_context_mask_per_cell:  tf.float32, [batch_size,22*21]/
-    row_context_segment_ids_per_cell/col_context_segment_ids_per_cell: [batch_size,22*21]/, segmentIDs, header tokens 0, data tokens 1.
+    row_context_segment_ids/col_context_segment_ids: [batch_size, height*max_cell_context_length], segmentIDs, header tokens 0, data tokens 1.
+    row_cell_indices/col_cell_indices: tf.int, [batch_size, row_height(22)*row_width(21)]/[batch_size, (col_height+1)(22)*col_width(22)], used for pointer network.
+    row_context_mask_per_cell/col_context_mask_per_cell:  tf.float32, [batch_size,22*21]/[batch_size,?], useless.
+    row_context_segment_ids_per_cell/col_context_segment_ids_per_cell: [batch_size,22*21]/[batch_size,?], useless.
     exclude_headers: bool.
-    max_cell_context_length: int, L in paper?
+    max_cell_context_length: int, L in paper.
     num_rows: int, D in paper?
-    record_index/column_index: [batch_size, cell_num], for cell position encoding if cell_context_encoding = False.
+    record_index/column_index: [batch_size, ?], get cell_indices_embeddings for cell position encoding, take final encoder_state as initial decoder_state.
     layer_norm: bool, add layer normalization layer after fully connected layer of the context encoder.
-    cell_position_encoding: bool
-    cell_context_encoding: bool
-    use_bert: bool
-    use_mobilebert: bool
-    per_row_encoding: bool, do not use bundle, feed each row seperately to BERT
-    max_pooling: bool
-    use_cnn: bool
-    use_pointer_network: bool
-    two_stage_decoding: bool
+    cell_position_encoding: bool, if True and cell_context_encoding id False, use different LSTM for position encoding and formula decoding.
+    cell_context_encoding: bool.
+    use_bert: bool.
+    use_mobilebert: bool.
+    per_row_encoding: bool, do not use bundle, feed each row seperately to BERT.
+    max_pooling: bool.
+    use_cnn: bool.
+    use_pointer_network: bool.
+    two_stage_decoding: bool.
     conv_type: str, "grid"/"cross" or else, if using "grid", convolution with a height*width kernel;
-                if using "cross", convolution with a row-wise and column-wise kernel and add the result; else only use column-wise kernel
-    grid_type: str, "col"/"row"/"both", BERT type
+                if using "cross", convolution with a row-wise and column-wise kernel and add the result; else only use column-wise kernel.
+    grid_type: str, "col"/"row"/"both", BERT type.
     skip_connection: bool, if True, concat convolution output and BERT encoding output; if False only use convolution output.
     bert_config: bert_modeling.BertModel(bert_config).
-    unused_tensors_to_print: not used
+    unused_tensors_to_print: not used.
     formula_length: int.
     formula_prefix_length: int.
-    vocab_size: int, size of output formula token vocabulary, including sketches(vocab_size-42) and ranges(42).
+    vocab_size: int, size of output formula token vocabulary, including all special tokens (42) and others.
     beam_size: int, if is_training is True, beam_size should be 1.
     use_tpu: bool, for beam search.
     use_one_hot_embeddings: bool, for BertModel.
@@ -213,7 +213,7 @@ def create_model(
               row_context_encoder_cells)
 
       # header_encoding[batch_size, max_cell_context_length, -1] if per_row_encoding is False,
-      # list row_context_grid of length height,
+      # height-list row_context_grid,
       # element size: [batch_size, max_cell_context_length, -1]
       for i in range(st_idx, height, chunk_size):
 
@@ -437,13 +437,13 @@ def create_model(
             batch_row_indices = tf.repeat(
                 batch_row_indices, repeats=row_height * row_width, axis=1)
             batch_row_indices = tf.reshape(
-                batch_row_indices, [batch_size * row_height * row_width])
+                batch_row_indices, [batch_size * row_height * row_width]) # [batch_size * row_height * row_width]
             row_indices = tf.range(tf.to_int32(row_height))
             row_indices = tf.expand_dims(row_indices, dim=-1)
             row_indices = tf.repeat(row_indices, repeats=row_width, axis=1)
             row_indices = tf.repeat(row_indices, repeats=batch_size, axis=0)
             row_indices = tf.reshape(
-                row_indices, [batch_size * row_height * row_width])
+                row_indices, [batch_size * row_height * row_width]) # [batch_size * row_height * row_width]
             row_cell_indices = tf.reshape(
                 row_cell_indices, [batch_size * row_height * row_width])
             row_cell_indices = tf.stack([batch_row_indices, row_indices,
@@ -807,6 +807,9 @@ def create_model(
              for _ in range(num_decoder_layers)]
     cells = tf.nn.rnn_cell.MultiRNNCell(cells)
 
+    # return:
+    #   pred_logits: [batch_size, vocab_size],
+    #   beam_search_state: updated {decoder_state, formula_mask, range_bool_mask}
     def symbols_to_logits(partial_seqs, cur_step, beam_search_state):
       decoder_state = beam_search_state.get("decoder_state")
       input_tokens = tf.slice(
@@ -817,7 +820,7 @@ def create_model(
 
       sketch_idx = tf.constant(constants.END_FORMULA_SKETCH_ID, dtype=tf.int32)
 
-      # is_training=True:
+      # is_training=True: sketch_mask to range_mask where $ENDFORMULASKETCH$ appears
       #   cur_formula_mask=sketch_mask,
       #   [batch_size, vocab_size]<-([batch_size], [batch_size, vocab_size], [batch_size, vocab_size])
       cur_formula_mask = tf.where(
@@ -961,16 +964,16 @@ def create_model(
 
       if two_stage_decoding:
         pred_logits = tf.where(
-            tf.equal(tf.reshape(cur_range_bool_mask, [-1]), 0), # [batch_size, 1]
+            tf.equal(tf.reshape(cur_range_bool_mask, [-1]), 0), # [batch_size] ??? 0->1
             tf.squeeze(sketch_logits, axis=-2),  # [batch_size, height', vocab_size]?
-            range_logits)
+            range_logits) # [batch_size, height', vocab_size]
       elif use_pointer_network:
         pred_logits = range_logits
       else:
         pred_logits = tf.squeeze(sketch_logits, axis=-2)
 
       if cell_context_encoding and max_pooling:
-        pred_logits = tf.reduce_max(pred_logits, axis=1)
+        pred_logits = tf.reduce_max(pred_logits, axis=1)  # [batch_size, vocab_size]
 
       if two_stage_decoding:
         pred_logits -= 1e6 * (1 - cur_formula_mask)
@@ -1054,7 +1057,7 @@ def create_model(
       beam_search_state.update({"decoder_state": decoder_state})
       initial_input_tokens = tf.slice(
           full_formula, [0, formula_prefix_length], [batch_size, 1])
-      initial_input_tokens = tf.squeeze(initial_input_tokens, axis=1)
+      initial_input_tokens = tf.squeeze(initial_input_tokens, axis=1) # [batch_size]
       beam_seqs, beam_probs, _ = beam_search.beam_search(
           symbols_to_logits_fn=symbols_to_logits,
           initial_ids=initial_input_tokens,
